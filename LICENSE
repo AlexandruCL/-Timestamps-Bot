@@ -4,6 +4,18 @@ Copyright (c) 2025 Cristea Laur-Alexandru
 
 This repository is provided solely to showcase the bot. It is NOT free to use.
 
+Scope
+- “Software” means all content in this repository, including without limitation:
+  - Source code and scripts (e.g., pontaje.py, database.py)
+  - Configuration, examples, and templates (.env.example and similar)
+  - Documentation, README, changelogs, and any text files
+  - Build/packaging files, workflows, and deployment manifests
+  - Images, icons, and other assets included in the repo
+  - Compiled or generated forms of the foregoing (binaries, bytecode, distributions)
+  - Database schemas, migration files, and data models supplied here
+- Third‑party dependencies are governed by their own licenses and are excluded from relicensing by this document.
+
+
 1) No license granted
    Except as expressly permitted below, no rights are granted to copy, download, run, compile, modify, distribute, host, or otherwise use the Software or any part of it.
 
