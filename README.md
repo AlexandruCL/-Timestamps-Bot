@@ -146,4 +146,4 @@ ACTIVITY_API_SHEET=
 - The DB layer is abstracted in database.py (SQLite recommended).
 
 ## License
-MIT, see license in the repository.
+See license in the repository.
