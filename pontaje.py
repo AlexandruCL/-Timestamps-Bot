@@ -184,8 +184,8 @@ async def log_command(
             await channel.send(embed=embed)
         except Exception:
             pass
-    
-    if action == "adaugaminute-button" and ADDMINUTES_LOG_CHANNEL_ID:
+
+    if (action == "adaugaminute-button" or action == "adaugaminute-sas-button") and ADDMINUTES_LOG_CHANNEL_ID:
         for cid in ADDMINUTES_LOG_CHANNEL_ID:
             if channel and cid == channel.id:
                 continue  # avoid duplicate in same channel
@@ -900,7 +900,7 @@ class HrButtons(discord.ui.View):
                 ephemeral=True
             )
             return
-        view = AddMinutesUserSelectView(interaction.user.id)
+        view = AddMinutesUserSelectView(interaction.user.id, is_sas=False)
         await interaction.response.send_message(
             embed=make_embed("Adaugă Minute", "Selectează userul pentru care adaugi minute.", discord.Color.blurple(), interaction.user),
             view=view,
@@ -1132,7 +1132,6 @@ class SASCoordonatorButtons(discord.ui.View):
         except Exception:
             pass   
 
-
     @discord.ui.button(label="Pontaje / ZI", style=discord.ButtonStyle.grey, custom_id="day_report_sas_btn")
     async def day_report_sas_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._check_basic(interaction):
@@ -1159,6 +1158,32 @@ class SASCoordonatorButtons(discord.ui.View):
             )
         try:
             await log_command(interaction, "pontaje-sas", changed=False, extra=f"month={now.month} year={now.year}")
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Adaugă Minute", style=discord.ButtonStyle.grey, custom_id="add_minutes_sas_btn")
+    async def add_minutes_sas_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Channel + perms
+        if not interaction.channel or interaction.channel.id != SAS_CHANNEL_ID:
+            await interaction.response.send_message(
+                embed=make_embed("Canal invalid", f"Folosește în <#{SAS_CHANNEL_ID}>.", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return
+        if not is_csas(interaction.user):
+            await interaction.response.send_message(
+                embed=make_embed("Permisiune", "Necesită Coordonator SAS.", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return
+        view = AddMinutesUserSelectView(interaction.user.id, is_sas=True)
+        await interaction.response.send_message(
+            embed=make_embed("Adaugă Minute", "Selectează userul pentru care adaugi minute.", discord.Color.blurple(), interaction.user),
+            view=view,
+            ephemeral=True
+        )
+        try:
+            await log_command(interaction, "adaugaminute-sas-panel-open", changed=False)
         except Exception:
             pass
 
@@ -1770,10 +1795,11 @@ class WarnUserSelectView(discord.ui.View):
         return True
 
 class AddMinutesModal(discord.ui.Modal, title="Adaugă Minute"):
-    def __init__(self, actor: discord.Member, target: discord.Member):
+    def __init__(self, actor: discord.Member, target: discord.Member, is_sas: bool):
         super().__init__(timeout=300)
         self.actor = actor
         self.target = target
+        self.is_sas = is_sas
         today = local_now().strftime("%Y-%m-%d")
         self.date_input = discord.ui.TextInput(
             label="Data (YYYY-MM-DD)",
@@ -1793,9 +1819,15 @@ class AddMinutesModal(discord.ui.Modal, title="Adaugă Minute"):
 
     async def on_submit(self, interaction: discord.Interaction):
         # Permission check
-        if not is_mgmt(interaction.user):
-            await interaction.response.send_message("Permisiune refuzată.", ephemeral=True)
-            return
+        if self.is_sas:
+            if not is_csas(interaction.user):
+                await interaction.response.send_message("Permisiune refuzată.", ephemeral=True)
+                return
+        else:
+            if not is_mgmt(interaction.user):
+                await interaction.response.send_message("Permisiune refuzată.", ephemeral=True)
+                return
+            
         date_str = self.date_input.value.strip()
         minutes_raw = self.minutes_input.value.strip().replace(",", ".")
         # Validate date
@@ -1824,7 +1856,10 @@ class AddMinutesModal(discord.ui.Modal, title="Adaugă Minute"):
             return
 
         # Replicate /adaugaminute logic
-        sessions = get_clock_times(self.target.id, date_str)
+        if self.is_sas:
+            sessions = get_clock_times_sas(self.target.id, date_str)
+        else:
+            sessions = get_clock_times(self.target.id, date_str)
 
         # Pick a unique start time beginning at 00:00:00 to avoid duplicates.
         occupied = {s[0] for s in sessions if s and s[0]}
@@ -1838,33 +1873,51 @@ class AddMinutesModal(discord.ui.Modal, title="Adaugă Minute"):
             new_co = base_dt.replace(hour=23, minute=59, second=59)
 
         # Insert new session (finished)
-        add_clock_in(self.target.id, date_str, base_dt.strftime("%H:%M:%S"))
-        update_clock_out(self.target.id, date_str, new_co.strftime("%H:%M:%S"), base_dt.strftime("%H:%M:%S"))
-        msg = f"Sesiune nouă {base_dt.strftime('%H:%M:%S')} -> {new_co.strftime('%H:%M:%S')} ({minutes_val:.0f}m)"
-
+        if self.is_sas:
+            add_clock_in_sas(self.target.id, date_str, base_dt.strftime("%H:%M:%S"))
+            update_clock_out_sas(self.target.id, date_str, new_co.strftime("%H:%M:%S"), base_dt.strftime("%H:%M:%S"))
+            msg = f"Sesiune nouă SAS {base_dt.strftime('%H:%M:%S')} -> {new_co.strftime('%H:%M:%S')} ({minutes_val:.0f}m)"
+        else:
+            add_clock_in(self.target.id, date_str, base_dt.strftime("%H:%M:%S"))
+            update_clock_out(self.target.id, date_str, new_co.strftime("%H:%M:%S"), base_dt.strftime("%H:%M:%S"))
+            msg = f"Sesiune nouă {base_dt.strftime('%H:%M:%S')} -> {new_co.strftime('%H:%M:%S')} ({minutes_val:.0f}m)"
+        
         await interaction.response.send_message(
             embed=make_embed("Minute adăugate", f"{self.target.mention} | {msg}", discord.Color.green(), interaction.user),
             ephemeral=True
         )
         try:
-            await log_command(
-                interaction,
-                "adaugaminute-button",
-                target=self.target,
-                changed=True,
-                extra=f"date={date_str} minutes={minutes_val}"
-            )
+            if self.is_sas:
+                await log_command(
+                    interaction,
+                    "adaugaminute-sas-button",
+                    target=self.target,
+                    changed=True,
+                    extra=f"date={date_str} minutes={minutes_val}"
+                )
+            else:
+                await log_command(
+                    interaction,
+                    "adaugaminute-button",
+                    target=self.target,
+                    changed=True,
+                    extra=f"date={date_str} minutes={minutes_val}"
+                )
         except Exception:
             pass
         try:
-            await self.target.send(f"{minutes_val:.0f} minute adaugate prin sesiunea {base_dt.strftime('%H:%M:%S')} -> {new_co.strftime('%H:%M:%S')}  de {interaction.user.display_name}.")
+            if self.is_sas:
+                await self.target.send(f"{minutes_val:.0f} minute adaugate prin sesiunea SAS {base_dt.strftime('%H:%M:%S')} -> {new_co.strftime('%H:%M:%S')}  de {interaction.user.display_name}.")
+            else:
+                await self.target.send(f"{minutes_val:.0f} minute adaugate prin sesiunea {base_dt.strftime('%H:%M:%S')} -> {new_co.strftime('%H:%M:%S')}  de {interaction.user.display_name}.")
         except Exception:
             pass
 
 class AddMinutesUserSelect(discord.ui.UserSelect):
-    def __init__(self, parent: "AddMinutesUserSelectView"):
+    def __init__(self, parent: "AddMinutesUserSelectView", is_sas: bool):
         super().__init__(placeholder="Selectează user", min_values=1, max_values=1)
         self.parent_view = parent
+        self.is_sas = is_sas
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.parent_view.requester_id:
@@ -1872,17 +1925,18 @@ class AddMinutesUserSelect(discord.ui.UserSelect):
             return
         member = self.values[0]
         # Open modal
-        await interaction.response.send_modal(AddMinutesModal(interaction.user, member))
+        await interaction.response.send_modal(AddMinutesModal(interaction.user, member, is_sas=self.is_sas))
         try:
             await log_command(interaction, "addminutes-target-select", target=member, changed=False)
         except Exception:
             pass
 
 class AddMinutesUserSelectView(discord.ui.View):
-    def __init__(self, requester_id: int):
+    def __init__(self, requester_id: int, is_sas: bool):
         super().__init__(timeout=120)
         self.requester_id = requester_id
-        self.add_item(AddMinutesUserSelect(self))
+        self.is_sas = is_sas
+        self.add_item(AddMinutesUserSelect(self, is_sas=self.is_sas))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.requester_id:
