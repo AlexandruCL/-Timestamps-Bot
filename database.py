@@ -113,13 +113,23 @@ def add_clock_in_sas(user_id: int, date: str, clock_in: str):
     )
     conn.commit(); conn.close()
 
-def update_clock_out_sas(user_id: int, date: str, clock_out: str):
-    conn = sqlite3.connect('clock_times.db'); cur = conn.cursor()
-    cur.execute(
-        "UPDATE clock_times_sas SET clock_out=? WHERE user_id=? AND date=? AND clock_out IS NULL",
-        (clock_out, user_id, date)
-    )
-    conn.commit(); conn.close()
+def update_clock_out_sas(user_id: int, date: str, clock_out: str, start_time: str | None = None):
+    conn = sqlite3.connect('clock_times.db')
+    c = conn.cursor()
+    if start_time:
+        # Close only the session that started at start_time
+        c.execute(
+            "UPDATE clock_times_sas SET clock_out=? WHERE user_id=? AND date=? AND clock_in=?",
+            (clock_out, user_id, date, start_time)
+        )
+    else:
+        # Fallback: close the most recent open session
+        c.execute(
+            "UPDATE clock_times_sas SET clock_out=? WHERE user_id=? AND date=? AND clock_out IS NULL",
+            (clock_out, user_id, date)
+        )
+    conn.commit()
+    conn.close()
 
 def get_clock_times_sas(user_id: int, date: str):
     conn = sqlite3.connect('clock_times.db'); cur = conn.cursor()
