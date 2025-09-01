@@ -2227,6 +2227,7 @@ class Bot(commands.Bot):
             self.add_view(SASClockButtons())
             self.add_view(HrButtons())
             self.add_view(RelayButtons())
+            self.add_view(SASCoordonatorButtons())
         except NameError:
             # View defined later; silent if ordering changes
             pass
