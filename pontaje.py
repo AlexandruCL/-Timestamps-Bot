@@ -16,12 +16,16 @@ import aiohttp
 import sys
 import select
 import time
+import sqlite3
+from discord import app_commands
 
 from database import (
     init_db, add_clock_in, update_clock_out, get_clock_times,
     get_ongoing_sessions, remove_session,
     increment_punish_count, get_punish_count, reset_punish_count,
-    add_clock_in_sas, update_clock_out_sas, get_clock_times_sas, get_ongoing_sessions_sas, remove_session_sas
+    add_clock_in_sas, update_clock_out_sas, get_clock_times_sas, get_ongoing_sessions_sas, remove_session_sas,
+    checkpoint_and_vacuum,  # <-- add
+    db_stats,
 )
 
 # --------------- Environment ---------------
@@ -69,6 +73,8 @@ ACTIVITY_API_TOKEN = os.getenv("ACTIVITY_API_TOKEN")
 ACTIVITY_API_SHEET = os.getenv("ACTIVITY_API_SHEET", "RAZII")  
 
 CALLSIGN_RE = re.compile(r"\[?S-(\d{1,2})\]?", re.IGNORECASE)
+PD_CALLSIGN_RE = re.compile(r"\[(\d{1,3})\]")  
+
 
 if not SAS_ROLE_IDS:
     logging.warning("SAS_ROLE_IDS empty – SAS buttons/commands will always fail role check.")
@@ -228,10 +234,32 @@ def _list_pd_members(guild: discord.Guild) -> list[discord.Member]:
             out.append(m)
     return out
 
+def _callsign_sort_key(member: discord.Member, *, is_sas: bool) -> tuple[int, str]:
+    """
+    Returns a tuple used for sorting members by callsign.
+    Members without a detectable callsign are pushed to the end.
+    """
+    name = (member.display_name or member.name or "")
+    n = 10**6  # large default -> goes to end
+    m = CALLSIGN_RE.search(name) if is_sas else PD_CALLSIGN_RE.search(name)
+    if not m and not is_sas:
+        # PD fallback: try to catch bare numbers like "001 Name"
+        m = re.search(r"\b(\d{1,3})\b", name)
+    if m:
+        try:
+            n = int(m.group(1))
+        except Exception:
+            pass
+    return (n, name.lower())
+
 def build_day_report(date_str: str, guild: discord.Guild, member: discord.Member | None = None, *, is_sas: bool = False) -> tuple[str, list[str]]:
     getter = get_clock_times if not is_sas else get_clock_times_sas
     lines = []
     members = [member] if member else _list_pd_members(guild)
+
+    if not member:
+        members = sorted(members, key=lambda m: _callsign_sort_key(m, is_sas=is_sas))
+
     for mem in members:
         sessions = getter(mem.id, date_str)
         total = 0
@@ -677,7 +705,22 @@ class ClockButtons(discord.ui.View):
                     ephemeral=True
                 )
                 return
-        add_clock_in(user_id, date_str, now.strftime("%H:%M:%S"))
+        try:
+            add_clock_in(user_id, date_str, now.strftime("%H:%M:%S"))
+        except sqlite3.OperationalError as e:
+            if "database or disk is full" in str(e).lower():
+                # try to reclaim space and retry once
+                try:
+                    checkpoint_and_vacuum()
+                    add_clock_in(user_id, date_str, now.strftime("%H:%M:%S"))
+                except Exception:
+                    await interaction.followup.send(
+                        embed=make_embed("Stocare plină", "Nu se poate salva în DB. Rulează VACUUM sau eliberează spațiu.", discord.Color.red(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+            else:
+                raise
         await interaction.followup.send(
             embed=make_embed("Clock IN", f"Start {now.strftime('%H:%M:%S')} ({date_str})", discord.Color.green(), interaction.user),
             ephemeral=True
@@ -980,7 +1023,22 @@ class SASClockButtons(discord.ui.View):
                 ephemeral=True
             )
             return
-        add_clock_in_sas(uid, date, now.strftime("%H:%M:%S"))
+        try:
+            add_clock_in_sas(uid, date, now.strftime("%H:%M:%S"))
+        except sqlite3.OperationalError as e:
+            if "database or disk is full" in str(e).lower():
+                # try to reclaim space and retry once
+                try:
+                    checkpoint_and_vacuum()
+                    add_clock_in_sas(uid, date, now.strftime("%H:%M:%S"))
+                except Exception:
+                    await interaction.followup.send(
+                        embed=make_embed("Stocare plină", "Nu se poate salva în DB. Rulează VACUUM sau eliberează spațiu.", discord.Color.red(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+            else:
+                raise
         await interaction.followup.send(
             embed=make_embed("SAS IN", f"Start {now.strftime('%H:%M:%S')} ({date})", discord.Color.green(), interaction.user),
             ephemeral=True
@@ -2979,6 +3037,36 @@ async def relay_cmd(ctx: commands.Context):
         embed=make_embed("Relay Panel", "Apasă 'Say' pentru a-ți deschide draftul Relay.", discord.Color.blurple(), ctx.author),
         view=RelayButtons()
     )
+
+@bot.command(name="dbv", aliases=["dbvacumm"], help="Checkpoint WAL + VACUUM (owner only)")
+async def dbvacuum_prefix(ctx: commands.Context):
+    OWNER_ID = 286492096242909185
+    if ctx.author.id != OWNER_ID:
+        try:
+            await ctx.reply("Permisiune refuzată.", mention_author=False, delete_after=5)
+        except Exception:
+            pass
+        return
+    try:
+        checkpoint_and_vacuum()
+        await ctx.reply(f"VACUUM OK. {db_stats()}", mention_author=False)
+    except Exception as e:
+        await ctx.reply(f"Eroare: {e}", mention_author=False)
+
+@bot.command(name="dbs", aliases=["dbstats"], help="Afișează statistici DB (owner only)")
+async def db_stats_command(ctx: commands.Context):
+    OWNER_ID = 286492096242909185
+    if ctx.author.id != OWNER_ID:
+        try:
+            await ctx.reply("Permisiune refuzată.", mention_author=False, delete_after=5)
+        except Exception:
+            pass
+        return
+    try:
+        db_stats_text = db_stats()
+        await ctx.reply(f"DB Stats:\n{db_stats_text}", mention_author=False)
+    except Exception as e:
+        await ctx.reply(f"Eroare: {e}", mention_author=False)
 # --------------- Run ---------------
 if __name__ == "__main__":
     if not TOKEN:
