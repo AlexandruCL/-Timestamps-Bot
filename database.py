@@ -20,9 +20,40 @@ def init_db():
             clock_out TEXT
         )
     """)
+    try:
+        c.execute("PRAGMA journal_mode=WAL;")
+        c.execute("PRAGMA synchronous=NORMAL;")
+        c.execute("PRAGMA wal_autocheckpoint=1000;")      # checkpoint roughly every ~1k pages
+        c.execute("PRAGMA journal_size_limit=10485760;")   # cap WAL to ~10 MB
+        c.execute("PRAGMA temp_store=MEMORY;")             # avoid /tmp writes
+        c.execute("PRAGMA auto_vacuum=INCREMENTAL;")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
+
+def checkpoint_and_vacuum() -> None:
+    conn = sqlite3.connect('clock_times.db')
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        conn.execute("VACUUM;")
+    finally:
+        conn.close()
+
+def db_stats() -> str:
+    try:
+        conn = sqlite3.connect('clock_times.db')
+        cur = conn.cursor()
+        cur.execute("PRAGMA page_count"); pages = cur.fetchone()[0]
+        cur.execute("PRAGMA page_size"); psize = cur.fetchone()[0]
+        cur.execute("PRAGMA freelist_count"); freep = cur.fetchone()[0]
+        conn.close()
+        size = pages * psize
+        free = freep * psize
+        return f"size={size}B free={free}B page_size={psize}"
+    except Exception as e:
+        return f"stats_error:{e}"
 
 def add_clock_in(user_id, date, clock_in):
     conn = sqlite3.connect('clock_times.db')
