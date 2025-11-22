@@ -18,6 +18,9 @@ import select
 import time
 import sqlite3
 from discord import app_commands
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import io
 
 from database import (
     init_db, add_clock_in, update_clock_out, get_clock_times,
@@ -75,6 +78,11 @@ ACTIVITY_API_SHEET = os.getenv("ACTIVITY_API_SHEET", "RAZII")
 CALLSIGN_RE = re.compile(r"\[?S-(\d{1,2})\]?", re.IGNORECASE)
 PD_CALLSIGN_RE = re.compile(r"\[(\d{1,3})\]")  
 
+GOOGLE_SHEETS_CREDENTIALS_FILE = os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE")
+PD_SPREADSHEET_ID = os.getenv("PD_SPREADSHEET_ID")
+SAS_SPREADSHEET_ID = os.getenv("SAS_SPREADSHEET_ID")
+SAS_MEMBER_NOTIFICATIONS_CHANNEL_ID = int(os.getenv("SAS_MEMBER_NOTIFICATIONS_CHANNEL_ID", "0"))  # Add this line
+SAS_EVIDENTA_CHANNEL_ID = int(need("SAS_EVIDENTA_CHANNEL_ID"))
 
 if not SAS_ROLE_IDS:
     logging.warning("SAS_ROLE_IDS empty – SAS buttons/commands will always fail role check.")
@@ -252,6 +260,83 @@ def _callsign_sort_key(member: discord.Member, *, is_sas: bool) -> tuple[int, st
             pass
     return (n, name.lower())
 
+def _get_week_dates(reference_date: datetime.datetime | None = None) -> tuple[str, list[str]]:
+    """
+    Returns (week_label, [date_strings]) for Sunday-Saturday week containing reference_date.
+    date_strings are in YYYY-MM-DD format, starting with Sunday.
+    """
+    if reference_date is None:
+        reference_date = local_now()
+    
+    # Find the Sunday of the current week (weekday 6 = Sunday in Python)
+    days_since_sunday = (reference_date.weekday() + 1) % 7
+    sunday = reference_date - datetime.timedelta(days=days_since_sunday)
+    
+    # Generate all 7 days (Sunday through Saturday)
+    week_dates = []
+    for i in range(7):
+        day = sunday + datetime.timedelta(days=i)
+        week_dates.append(day.strftime("%Y-%m-%d"))
+    
+    # Week label: "DD.MM - DD.MM.YYYY"
+    week_label = f"{sunday.strftime('%d.%m')} - {(sunday + datetime.timedelta(days=6)).strftime('%d.%m.%Y')}"
+    
+    return week_label, week_dates
+
+def build_week_report_sas(guild: discord.Guild, week_dates: list[str]) -> list[str]:
+    """
+    Build weekly report for SAS members.
+    Returns lines containing the formatted table.
+    """
+    # Get all SAS members
+    members = []
+    for m in guild.members:
+        if not m.bot and has_role(m, SAS_ROLE_IDS):
+            members.append(m)
+    
+    # Sort by callsign
+    members = sorted(members, key=lambda m: _callsign_sort_key(m, is_sas=True))
+    
+    # Build table header
+    day_names = ["Du", "Lu", "Ma", "Mi", "Jo", "Vi", "Sb"]
+    header = f"{'Nume':<25} " + " ".join(f"{d:>6}" for d in day_names) + "  Total"
+    lines = [header, "-" * len(header)]
+    
+    # Build rows for ALL members
+    for mem in members:
+        # Use display name instead of callsign
+        display_name = (mem.display_name or mem.name or "Unknown")[:25]  # Limit to 25 chars
+        
+        # Calculate minutes for each day
+        day_minutes = []
+        total = 0
+        
+        for date_str in week_dates:
+            sessions = get_clock_times_sas(mem.id, date_str)
+            day_total = 0
+            
+            for s in sessions:
+                if s[0] and s[1]:
+                    ci = parse_local(date_str, s[0])
+                    co = parse_local(date_str, s[1])
+                    mins = (co - ci).total_seconds() / 60
+                    r = round_minutes(mins)
+                    if r > 0:
+                        day_total += r
+            
+            day_minutes.append(day_total)
+            total += day_total
+        
+        # Include ALL members (even with 0 total)
+        day_str = " ".join(f"{int(m):>6}" for m in day_minutes)
+        row = f"{display_name:<25} {day_str}  {int(total):>5}"
+        lines.append(row)
+    
+    if len(lines) == 2:  # Only header + separator (no members with SAS role)
+        lines.append("Niciun membru SAS găsit.")
+    
+    return lines
+
 def build_day_report(date_str: str, guild: discord.Guild, member: discord.Member | None = None, *, is_sas: bool = False) -> tuple[str, list[str]]:
     getter = get_clock_times if not is_sas else get_clock_times_sas
     lines = []
@@ -368,6 +453,265 @@ async def _post_warn(
         body = f"Status warn: {count}/3"
         embed = _build_warn_embed(actor, target, "Status Warn", body, discord.Color.blurple())
         await ch.send(embed=embed)
+
+# --------------- SAS EVIDENTA MEMBRII ---------------
+
+def get_google_sheets_client():
+    """Initialize and return Google Sheets client."""
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_SHEETS_CREDENTIALS_FILE, scope)
+    return gspread.authorize(creds)
+
+def _extract_pd_callsign(member: discord.Member | None) -> str | None:
+    """Extract PD callsign [xxx] from member display name."""
+    if not member:
+        return None
+    name = (member.display_name or member.name)
+    m = PD_CALLSIGN_RE.search(name)
+    if not m:
+        return None
+    digits = m.group(1)
+    try:
+        num = int(digits)
+    except ValueError:
+        logging.warning("Invalid PD callsign digits '%s' in name '%s'", digits, name)
+        return None
+    if num < 1 or num > 999:
+        return None
+    return digits  # Return as-is (e.g., "203", "005")
+
+def get_pd_id_by_callsign(callsign: str) -> str | None:
+    """Find PD ID (column A) by callsign in PD spreadsheet."""
+    try:
+        client = get_google_sheets_client()
+        sheet = client.open_by_key(PD_SPREADSHEET_ID).sheet1
+        
+        # Search for callsign in the sheet
+        cell = sheet.find(callsign)
+        if cell:
+            # Get ID from column A of the same row
+            return sheet.cell(cell.row, 1).value
+        return None
+    except Exception as e:
+        logging.error(f"Error getting PD ID for callsign {callsign}: {e}")
+        return None
+
+def add_member_to_sas_excel(discord_id: str) -> tuple[bool, str]:
+    """
+    Add member ID to first empty spot in SAS excel (B23:B40).
+    Returns (success, message with callsign from column D).
+    """
+    try:
+        client = get_google_sheets_client()
+        sheet = client.open_by_key(SAS_SPREADSHEET_ID).sheet1
+        
+        # Get range B23:B40
+        cells = sheet.range('B23:B40')
+        
+        # Find first empty cell
+        for cell in cells:
+            if not cell.value or cell.value.strip() == "":
+                # Write as formula to trigger auto-complete in other columns
+                cell.value = discord_id
+                sheet.update_cells([cell])
+                
+                # Force recalculation
+                batch_data = [{
+                    'range': cell.address,
+                    'values': [[discord_id]]
+                }]
+                sheet.batch_update(batch_data, value_input_option='USER_ENTERED')
+                
+                # Get callsign from column D (same row)
+                row = cell.row
+                callsign_cell = sheet.cell(row, 4)  # Column D is index 4
+                callsign = callsign_cell.value or "N/A"
+                
+                return True, f"Membru adăugat: {callsign}"
+        
+        return False, "Nu există poziții libere în intervalul B23:B40"
+    except Exception as e:
+        logging.error(f"Error adding member to SAS excel: {e}")
+        return False, f"Eroare: {str(e)}"
+
+def move_member_in_sas_excel(discord_id: str, direction: str) -> tuple[bool, str]:
+    try:
+        client = get_google_sheets_client()
+        sheet = client.open_by_key(SAS_SPREADSHEET_ID).sheet1
+        
+        ranges = {
+            'coordonator_sas': sheet.range('B11:B12'),
+            'coordonator_teste': sheet.range('B14:B16'),
+            'agent_special': sheet.range('B18:B21'),
+            'agent_sas': sheet.range('B23:B40')
+        }
+        
+        member_range = None
+        member_cell = None
+        
+        for range_name, cells in ranges.items():
+            for cell in cells:
+                if cell.value == discord_id:
+                    member_range = range_name
+                    member_cell = cell
+                    break
+            if member_range:
+                break
+        
+        if not member_range:
+            return False, "Membrul nu a fost găsit în niciun interval"
+        
+        if direction == 'up':
+            if member_range == 'coordonator_sas':
+                return False, "Membrul este deja la Coordonator SAS (cel mai înalt rang)"
+            
+            elif member_range == 'coordonator_teste':
+                target_cells = ranges['coordonator_sas']
+                for target_cell in target_cells:
+                    if not target_cell.value or target_cell.value.strip() == "":
+                        # Move and trigger recalculation
+                        member_cell.value = ""
+                        target_cell.value = discord_id
+                        sheet.update_cells([member_cell, target_cell])
+                        
+                        # Force recalc
+                        batch_data = [
+                            {'range': member_cell.address, 'values': [[""]]},
+                            {'range': target_cell.address, 'values': [[discord_id]]}
+                        ]
+                        sheet.batch_update(batch_data, value_input_option='USER_ENTERED')
+                        
+                        # Get callsign from column D
+                        callsign = sheet.cell(target_cell.row, 4).value or "N/A"
+                        return True, f"Membru mutat la Coordonator SAS: {callsign}"
+                return False, "Nu există poziții libere în Coordonator SAS (B11:B12)"
+            
+            elif member_range == 'agent_special':
+                target_cells = ranges['coordonator_teste']
+                for target_cell in target_cells:
+                    if not target_cell.value or target_cell.value.strip() == "":
+                        member_cell.value = ""
+                        target_cell.value = discord_id
+                        sheet.update_cells([member_cell, target_cell])
+                        batch_data = [
+                            {'range': member_cell.address, 'values': [[""]]},
+                            {'range': target_cell.address, 'values': [[discord_id]]}
+                        ]
+                        sheet.batch_update(batch_data, value_input_option='USER_ENTERED')
+                        
+                        # Get callsign from column D
+                        callsign = sheet.cell(target_cell.row, 4).value or "N/A"
+                        return True, f"Membru mutat la Coordonator SAS - TESTE: {callsign}"
+                return False, "Nu există poziții libere în Coordonator SAS - TESTE (B14:B16)"
+            
+            elif member_range == 'agent_sas':
+                target_cells = ranges['agent_special']
+                for target_cell in target_cells:
+                    if not target_cell.value or target_cell.value.strip() == "":
+                        member_cell.value = ""
+                        target_cell.value = discord_id
+                        sheet.update_cells([member_cell, target_cell])
+                        batch_data = [
+                            {'range': member_cell.address, 'values': [[""]]},
+                            {'range': target_cell.address, 'values': [[discord_id]]}
+                        ]
+                        sheet.batch_update(batch_data, value_input_option='USER_ENTERED')
+                        
+                        # Get callsign from column D
+                        callsign = sheet.cell(target_cell.row, 4).value or "N/A"
+                        return True, f"Membru mutat la AGENT SPECIAL: {callsign}"
+                return False, "Nu există poziții libere în AGENT SPECIAL (B18:B21)"
+        
+        elif direction == 'down':
+            if member_range == 'agent_sas':
+                return False, "Membrul este deja la AGENT S.A.S (cel mai jos rang)"
+            
+            elif member_range == 'coordonator_sas':
+                target_cells = ranges['coordonator_teste']
+                for target_cell in target_cells:
+                    if not target_cell.value or target_cell.value.strip() == "":
+                        member_cell.value = ""
+                        target_cell.value = discord_id
+                        sheet.update_cells([member_cell, target_cell])
+                        batch_data = [
+                            {'range': member_cell.address, 'values': [[""]]},
+                            {'range': target_cell.address, 'values': [[discord_id]]}
+                        ]
+                        sheet.batch_update(batch_data, value_input_option='USER_ENTERED')
+                        
+                        # Get callsign from column D
+                        callsign = sheet.cell(target_cell.row, 4).value or "N/A"
+                        return True, f"Membru mutat la Coordonator SAS - TESTE: {callsign}"
+                return False, "Nu există poziții libere în Coordonator SAS - TESTE (B14:B16)"
+            
+            elif member_range == 'coordonator_teste':
+                target_cells = ranges['agent_special']
+                for target_cell in target_cells:
+                    if not target_cell.value or target_cell.value.strip() == "":
+                        member_cell.value = ""
+                        target_cell.value = discord_id
+                        sheet.update_cells([member_cell, target_cell])
+                        batch_data = [
+                            {'range': member_cell.address, 'values': [[""]]},
+                            {'range': target_cell.address, 'values': [[discord_id]]}
+                        ]
+                        sheet.batch_update(batch_data, value_input_option='USER_ENTERED')
+                        
+                        # Get callsign from column D
+                        callsign = sheet.cell(target_cell.row, 4).value or "N/A"
+                        return True, f"Membru mutat la AGENT SPECIAL: {callsign}"
+                return False, "Nu există poziții libere în AGENT SPECIAL (B18:B21)"
+            
+            elif member_range == 'agent_special':
+                target_cells = ranges['agent_sas']
+                for target_cell in target_cells:
+                    if not target_cell.value or target_cell.value.strip() == "":
+                        member_cell.value = ""
+                        target_cell.value = discord_id
+                        sheet.update_cells([member_cell, target_cell])
+                        batch_data = [
+                            {'range': member_cell.address, 'values': [[""]]},
+                            {'range': target_cell.address, 'values': [[discord_id]]}
+                        ]
+                        sheet.batch_update(batch_data, value_input_option='USER_ENTERED')
+                        
+                        # Get callsign from column D
+                        callsign = sheet.cell(target_cell.row, 4).value or "N/A"
+                        return True, f"Membru mutat la AGENT S.A.S: {callsign}"
+                return False, "Nu există poziții libere în AGENT S.A.S (B23:B40)"
+        
+        return False, "Direcție invalidă"
+    except Exception as e:
+        logging.error(f"Error moving member in SAS excel: {e}")
+        return False, f"Eroare: {str(e)}"
+    
+
+def remove_member_from_sas_excel(discord_id: str) -> tuple[bool, str]:
+    """
+    Remove member from SAS excel.
+    Returns (success, message).
+    """
+    try:
+        client = get_google_sheets_client()
+        sheet = client.open_by_key(SAS_SPREADSHEET_ID).sheet1
+
+        # Get range B7:B46
+        cells = sheet.range('B7:B46')
+        
+        # Find and clear member
+        found = False
+        for cell in cells:
+            if cell.value == discord_id:
+                cell.value = ""
+                sheet.update_cells([cell])
+                found = True
+                return True, f"Membru șters de la poziția {cell.address}"
+        
+        if not found:
+            return False, "Membrul nu a fost găsit în listă"
+    except Exception as e:
+        logging.error(f"Error removing member from SAS excel: {e}")
+        return False, f"Eroare: {str(e)}"
 
 # --------------- Calendar UI ---------------
 class DayButton(discord.ui.Button):
@@ -696,6 +1040,12 @@ class ClockButtons(discord.ui.View):
                 ephemeral=True
             )
             return
+        elif (now.hour == 5 and now.minute > 25 and now.minute < 30):
+            await interaction.followup.send(
+                embed=make_embed("Clock IN", "Nu poți să te înregistrezi înainte de ora 05:30. Așteaptă te rog până la 05:30", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return
         date_str = now.strftime("%Y-%m-%d")
         sessions = get_clock_times(user_id, date_str)
         for s in sessions:
@@ -1015,6 +1365,12 @@ class SASClockButtons(discord.ui.View):
                 ephemeral=True
             )
             return
+        elif (now.hour == 5 and now.minute > 25 and now.minute < 30):
+            await interaction.followup.send(
+                embed=make_embed("Clock IN", "Nu poți să te înregistrezi înainte de ora 05:30. Așteaptă te rog până la 05:30", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return
         date = now.strftime("%Y-%m-%d")
         sessions = get_clock_times_sas(uid, date)
         if any(s[1] is None for s in sessions):
@@ -1245,6 +1601,114 @@ class SASCoordonatorButtons(discord.ui.View):
         except Exception:
             pass
 
+    @discord.ui.button(label="Pontaje / Săptămânale", style=discord.ButtonStyle.grey, custom_id="week_report_sas_btn")
+    async def week_report_sas_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_basic(interaction):
+            return
+        if not is_csas(interaction.user):
+            await interaction.response.send_message(
+                embed=make_embed("Permisiune", "Necesită COORDONATOR SAS.", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return
+        
+        # Show week selection view instead of generating report immediately
+        view = WeekSelectionView(interaction.user.id)
+        await interaction.response.send_message(
+            embed=make_embed(
+                "Selectează Săptămâna",
+                "Alege săptămâna pentru raport:",
+                discord.Color.blurple(),
+                interaction.user
+            ),
+            view=view,
+            ephemeral=True
+        )
+
+class WeekSelectionView(discord.ui.View):
+    """View to select current or previous week for weekly report."""
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=180)
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Nu este sesiunea ta.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Săptămâna Curentă", style=discord.ButtonStyle.primary, custom_id="current_week_btn")
+    async def current_week_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._generate_week_report(interaction, weeks_ago=0)
+
+    @discord.ui.button(label="Săptămâna Trecută", style=discord.ButtonStyle.secondary, custom_id="previous_week_btn")
+    async def previous_week_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._generate_week_report(interaction, weeks_ago=1)
+
+    async def _generate_week_report(self, interaction: discord.Interaction, weeks_ago: int):
+        # Defer response as this might take time
+        await interaction.response.defer(ephemeral=True)
+        
+        # Calculate the reference date
+        reference_date = local_now() - datetime.timedelta(weeks=weeks_ago)
+        
+        week_label, week_dates = _get_week_dates(reference_date)
+        lines = build_week_report_sas(interaction.guild, week_dates)
+        
+        # Create well-formatted .txt file content
+        report_lines = []
+        
+        # Add header with title and date range
+        report_lines.append("=" * 80)
+        report_lines.append(f"RAPORT SĂPTĂMÂNAL SAS - {week_label}".center(80))
+        report_lines.append("=" * 80)
+        report_lines.append("")
+        
+        # Add the table (already formatted from build_week_report_sas)
+        report_lines.extend(lines)
+        
+        # Add footer with generation info
+        report_lines.append("")
+        report_lines.append("-" * 80)
+        report_lines.append(f"Generat la: {local_now().strftime('%d/%m/%Y %H:%M:%S')}")
+        report_lines.append(f"Generat de: {interaction.user.display_name}")
+        report_lines.append(f"Total membri: {len(lines) - 2}")  # Exclude header + separator
+        report_lines.append("=" * 80)
+        
+        report_text = "\n".join(report_lines)
+        
+        # Create file buffer with UTF-8 encoding (with BOM for better Windows compatibility)
+        file_buffer = io.BytesIO(report_text.encode('utf-8-sig'))
+        file_buffer.seek(0)
+        
+        # Create Discord file
+        filename = f"Raport_SAS_{week_label.replace(' ', '_').replace('.', '_')}.txt"
+        discord_file = discord.File(file_buffer, filename=filename)
+        
+        # Send file
+        await interaction.followup.send(
+            embed=make_embed(
+                f"📊 Raport Săptămânal SAS - {week_label}",
+                f"**Raport generat pentru {len(lines) - 2} membri.**\n\n"
+                f"Descarcă fișierul `.txt` de mai jos pentru a vizualiza raportul formatat.\n"
+                f"📁 Poate fi deschis în Notepad, Excel, sau orice editor de text.",
+                discord.Color.green(),
+                interaction.user
+            ),
+            file=discord_file,
+            ephemeral=True
+        )
+        
+        try:
+            await log_command(
+                interaction,
+                "week-report-sas",
+                changed=False,
+                extra=f"week={week_label} weeks_ago={weeks_ago} format=txt members={len(lines)-2}"
+            )
+        except Exception:
+            pass
+
 class RelayButtons(discord.ui.View):
     def __init__(self, ):
         super().__init__(timeout=None)
@@ -1332,6 +1796,544 @@ class RelayButtons(discord.ui.View):
             ephemeral=True
         )
 
+class SASMemberManagementButtons(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _check_basic(self, interaction: discord.Interaction) -> bool:
+        if not interaction.channel or interaction.channel.id != SAS_EVIDENTA_CHANNEL_ID:
+            await interaction.response.send_message(
+                embed=make_embed("Canal invalid", f"Folosește în <#{SAS_EVIDENTA_CHANNEL_ID}>.", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return False
+        if not has_role(interaction.user, SAS_COORDONATOR_IDS):
+            await interaction.response.send_message(
+                embed=make_embed("Permisiune", "Ai nevoie de rol SAS Coordonator.", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Add Member", style=discord.ButtonStyle.success, custom_id="sas_member_add_btn")
+    async def add_member_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_basic(interaction):
+            return
+        view = SASMemberSelectView(interaction.user.id, action="add")
+        await interaction.response.send_message(
+            embed=make_embed("Adaugă Membru SAS", "Selectează membrul pentru a-l adăuga în evidență.", discord.Color.blurple(), interaction.user),
+            view=view,
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Up Button", style=discord.ButtonStyle.primary, custom_id="sas_member_up_btn")
+    async def up_member_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_basic(interaction):
+            return
+        view = SASMemberSelectView(interaction.user.id, action="up")
+        await interaction.response.send_message(
+            embed=make_embed("Mută Membru Sus", "Selectează membrul pentru a-l promova.", discord.Color.blurple(), interaction.user),
+            view=view,
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Down Button", style=discord.ButtonStyle.primary, custom_id="sas_member_down_btn")
+    async def down_member_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_basic(interaction):
+            return
+        view = SASMemberSelectView(interaction.user.id, action="down")
+        await interaction.response.send_message(
+            embed=make_embed("Mută Membru Jos", "Selectează membrul pentru a-l muta în jos.", discord.Color.blurple(), interaction.user),
+            view=view,
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Out Button", style=discord.ButtonStyle.danger, custom_id="sas_member_out_btn")
+    async def out_member_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_basic(interaction):
+            return
+        view = SASMemberSelectView(interaction.user.id, action="out")
+        await interaction.response.send_message(
+            embed=make_embed("Șterge Membru SAS", "Selectează membrul pentru a-l șterge din evidență.", discord.Color.orange(), interaction.user),
+            view=view,
+            ephemeral=True
+        )
+
+class SASMemberUserSelect(discord.ui.UserSelect):
+    def __init__(self, parent: "SASMemberSelectView", action: str):
+        super().__init__(placeholder="Selectează user", min_values=1, max_values=1)
+        self.parent_view = parent
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.parent_view.requester_id:
+            await interaction.response.send_message("Nu este sesiunea ta.", ephemeral=True)
+            return
+        
+        member = self.values[0]
+        
+        # Defer response for long operations
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            if self.action == "add":
+                # Extract callsign
+                callsign = _extract_pd_callsign(member)
+                if not callsign:
+                    await interaction.followup.send(
+                        embed=make_embed("Eroare", f"Nu s-a putut extrage callsign-ul pentru {member.mention}. Format așteptat: [xxx]", discord.Color.red(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                # Get PD ID from PD excel
+                pd_id = get_pd_id_by_callsign(callsign)
+                if not pd_id:
+                    await interaction.followup.send(
+                        embed=make_embed("Eroare", f"Callsign-ul {callsign} nu a fost găsit în spreadsheet-ul PD.", discord.Color.red(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                # Add to SAS excel
+                success, message = add_member_to_sas_excel(pd_id)
+                color = discord.Color.green() if success else discord.Color.red()
+                await interaction.followup.send(
+                    embed=make_embed("Add Member" if success else "Eroare", f"{member.mention} ({callsign})\nID PD: {pd_id}\n{message}", color, interaction.user),
+                    ephemeral=True
+                )
+                
+                if success:
+                    await log_command(interaction, "sas-member-add", target=member, changed=True, extra=f"callsign={callsign} pd_id={pd_id}")
+                    # Send public notification
+                    if SAS_MEMBER_NOTIFICATIONS_CHANNEL_ID:
+                        notif_ch = bot.get_channel(SAS_MEMBER_NOTIFICATIONS_CHANNEL_ID)
+                        if notif_ch:
+                            notif_embed = discord.Embed(
+                                title="✅ Membru Adăugat în Evidență SAS",
+                                description=(
+                                    f"**Membru:** {member.mention}\n"
+                                    f"**Callsign PD:** {callsign}\n"
+                                    f"**Callsign SAS:** {message}\n"
+                                    f"**Adăugat de:** {interaction.user.mention}"
+                                ),
+                                color=discord.Color.green(),
+                                timestamp=local_now()
+                            )
+                            await notif_ch.send(embed=notif_embed)
+            
+            elif self.action == "up":
+                # Extract callsign and get PD ID
+                callsign = _extract_pd_callsign(member)
+                if not callsign:
+                    await interaction.followup.send(
+                        embed=make_embed("Eroare", f"Nu s-a putut extrage callsign-ul pentru {member.mention}.", discord.Color.red(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                pd_id = get_pd_id_by_callsign(callsign)
+                if not pd_id:
+                    await interaction.followup.send(
+                        embed=make_embed("Eroare", f"Callsign-ul {callsign} nu a fost găsit în spreadsheet-ul PD.", discord.Color.red(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                # Find current range
+                client = get_google_sheets_client()
+                sheet = client.open_by_key(SAS_SPREADSHEET_ID).sheet1
+                
+                ranges = {
+                    'coordonator_sas': sheet.range('B11:B12'),
+                    'coordonator_teste': sheet.range('B14:B16'),
+                    'agent_special': sheet.range('B18:B21'),
+                    'agent_sas': sheet.range('B23:B40')
+                }
+                
+                member_range = None
+                for range_name, cells in ranges.items():
+                    for cell in cells:
+                        if cell.value == pd_id:
+                            member_range = range_name
+                            break
+                    if member_range:
+                        break
+                
+                if not member_range:
+                    await interaction.followup.send(
+                        embed=make_embed("Eroare", "Membrul nu a fost găsit în evidență.", discord.Color.red(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                if member_range == 'coordonator_sas':
+                    await interaction.followup.send(
+                        embed=make_embed("Info", "Membrul este deja la Coordonator SAS (cel mai înalt rang).", discord.Color.orange(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                # Show role selection view
+                role_view = SASRoleSelectView(self.parent_view.requester_id, member, member_range)
+                if not role_view.available_roles:
+                    await interaction.followup.send(
+                        embed=make_embed("Info", "Nu există ranguri disponibile pentru promovare.", discord.Color.orange(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                await interaction.followup.send(
+                    embed=make_embed("Selectează Rang", f"{member.mention} ({callsign})\nSelectează rangul țintă pentru promovare:", discord.Color.blurple(), interaction.user),
+                    view=role_view,
+                    ephemeral=True
+                )
+            
+            elif self.action == "down":
+                # Extract callsign and get PD ID
+                callsign = _extract_pd_callsign(member)
+                if not callsign:
+                    await interaction.followup.send(
+                        embed=make_embed("Eroare", f"Nu s-a putut extrage callsign-ul pentru {member.mention}.", discord.Color.red(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                pd_id = get_pd_id_by_callsign(callsign)
+                if not pd_id:
+                    await interaction.followup.send(
+                        embed=make_embed("Eroare", f"Callsign-ul {callsign} nu a fost găsit în spreadsheet-ul PD.", discord.Color.red(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                # Find current range
+                client = get_google_sheets_client()
+                sheet = client.open_by_key(SAS_SPREADSHEET_ID).sheet1
+                
+                ranges = {
+                    'coordonator_sas': sheet.range('B11:B12'),
+                    'coordonator_teste': sheet.range('B14:B16'),
+                    'agent_special': sheet.range('B18:B21'),
+                    'agent_sas': sheet.range('B23:B40')
+                }
+                
+                member_range = None
+                for range_name, cells in ranges.items():
+                    for cell in cells:
+                        if cell.value == pd_id:
+                            member_range = range_name
+                            break
+                    if member_range:
+                        break
+                
+                if not member_range:
+                    await interaction.followup.send(
+                        embed=make_embed("Eroare", "Membrul nu a fost găsit în evidență.", discord.Color.red(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                if member_range == 'agent_sas':
+                    await interaction.followup.send(
+                        embed=make_embed("Info", "Membrul este deja la AGENT S.A.S (cel mai jos rang).", discord.Color.orange(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                # Show role selection view for demotion
+                role_view = SASRoleSelectView(self.parent_view.requester_id, member, member_range, is_demotion=True)
+                if not role_view.available_roles:
+                    await interaction.followup.send(
+                        embed=make_embed("Info", "Nu există ranguri disponibile pentru retrogradare.", discord.Color.orange(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                await interaction.followup.send(
+                    embed=make_embed("Selectează Rang", f"{member.mention} ({callsign})\nSelectează rangul țintă pentru retrogradare:", discord.Color.blurple(), interaction.user),
+                    view=role_view,
+                    ephemeral=True
+                )
+            
+            elif self.action == "out":
+                # Extract callsign and get PD ID
+                callsign = _extract_pd_callsign(member)
+                if not callsign:
+                    await interaction.followup.send(
+                        embed=make_embed("Eroare", f"Nu s-a putut extrage callsign-ul pentru {member.mention}.", discord.Color.red(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                pd_id = get_pd_id_by_callsign(callsign)
+                if not pd_id:
+                    await interaction.followup.send(
+                        embed=make_embed("Eroare", f"Callsign-ul {callsign} nu a fost găsit în spreadsheet-ul PD.", discord.Color.red(), interaction.user),
+                        ephemeral=True
+                    )
+                    return
+                
+                # Remove member
+                success, message = remove_member_from_sas_excel(pd_id)
+                color = discord.Color.green() if success else discord.Color.orange()
+                await interaction.followup.send(
+                    embed=make_embed("Remove Member" if success else "Info", f"{member.mention} ({callsign})\n{message}", color, interaction.user),
+                    ephemeral=True
+                )
+                
+                if success:
+                    await log_command(interaction, "sas-member-out", target=member, changed=True, extra=f"callsign={callsign} pd_id={pd_id}")
+                    # Send public notification
+                    if SAS_MEMBER_NOTIFICATIONS_CHANNEL_ID:
+                        notif_ch = bot.get_channel(SAS_MEMBER_NOTIFICATIONS_CHANNEL_ID)
+                        if notif_ch:
+                            notif_embed = discord.Embed(
+                                title="❌ Membru Șters din Evidență SAS",
+                                description=(
+                                    f"**Membru:** {member.mention}\n"
+                                    f"**Callsign PD:** {callsign}\n"
+                                    f"**Șters de:** {interaction.user.mention}"
+                                ),
+                                color=discord.Color.red(),
+                                timestamp=local_now()
+                            )
+                            await notif_ch.send(embed=notif_embed)
+        
+        except Exception as e:
+            logging.exception(f"Error in SAS member management: {e}")
+            await interaction.followup.send(
+                embed=make_embed("Eroare", f"A apărut o eroare: {str(e)}", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+
+class SASRoleSelectView(discord.ui.View):
+    """View to select target role for promotion or demotion."""
+    def __init__(self, requester_id: int, member: discord.Member, current_range: str, is_demotion: bool = False):
+        super().__init__(timeout=120)
+        self.requester_id = requester_id
+        self.member = member
+        self.current_range = current_range
+        self.is_demotion = is_demotion
+        
+        # Define available promotions/demotions based on current range
+        self.available_roles = self._get_available_roles()
+        
+        if not self.available_roles:
+            # No promotions/demotions available
+            return
+        
+        # Create select menu
+        options = [
+            discord.SelectOption(label=label, value=value, description=desc)
+            for label, value, desc in self.available_roles
+        ]
+        self.role_select = discord.ui.Select(
+            placeholder="Selectează rangul țintă",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.role_select.callback = self.role_select_callback
+        self.add_item(self.role_select)
+    
+    def _get_available_roles(self) -> list[tuple[str, str, str]]:
+        """Returns list of (label, value, description) for available promotions/demotions."""
+        if self.is_demotion:
+            # Demotions (reversed)
+            demotions = {
+                'coordonator_sas': [
+                    ('Coordonator SAS - TESTE', 'coordonator_teste', 'B14:B16'),
+                    ('AGENT SPECIAL', 'agent_special', 'B18:B21 - ALPHA/OMEGA/DELTA/TITAN'),
+                    ('AGENT S.A.S', 'agent_sas', 'B23:B40')
+                ],
+                'coordonator_teste': [
+                    ('AGENT SPECIAL', 'agent_special', 'B18:B21 - ALPHA/OMEGA/DELTA/TITAN'),
+                    ('AGENT S.A.S', 'agent_sas', 'B23:B40')
+                ],
+                'agent_special': [
+                    ('AGENT S.A.S', 'agent_sas', 'B23:B40')
+                ],
+                'agent_sas': []  # Already at bottom
+            }
+            return demotions.get(self.current_range, [])
+        else:
+            # Promotions
+            promotions = {
+                'agent_sas': [
+                    ('AGENT SPECIAL', 'agent_special', 'B18:B21 - ALPHA/OMEGA/DELTA/TITAN'),
+                    ('Coordonator SAS - TESTE', 'coordonator_teste', 'B14:B16'),
+                    ('Coordonator SAS', 'coordonator_sas', 'B11:B12')
+                ],
+                'agent_special': [
+                    ('Coordonator SAS - TESTE', 'coordonator_teste', 'B14:B16'),
+                    ('Coordonator SAS', 'coordonator_sas', 'B11:B12')
+                ],
+                'coordonator_teste': [
+                    ('Coordonator SAS', 'coordonator_sas', 'B11:B12')
+                ],
+                'coordonator_sas': []  # Already at top
+            }
+            return promotions.get(self.current_range, [])
+    
+    async def role_select_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Nu este sesiunea ta.", ephemeral=True)
+            return
+        
+        target_range = self.role_select.values[0]
+        
+        # Defer response
+        await interaction.response.defer(ephemeral=True)
+        
+        # Extract callsign and get PD ID
+        callsign = _extract_pd_callsign(self.member)
+        if not callsign:
+            await interaction.followup.send(
+                embed=make_embed("Eroare", f"Nu s-a putut extrage callsign-ul pentru {self.member.mention}.", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return
+        
+        pd_id = get_pd_id_by_callsign(callsign)
+        if not pd_id:
+            await interaction.followup.send(
+                embed=make_embed("Eroare", f"Callsign-ul {callsign} nu a fost găsit în spreadsheet-ul PD.", discord.Color.red(), interaction.user),
+                ephemeral=True
+            )
+            return
+        
+        # Move member to selected range
+        success, message = move_member_to_specific_range(pd_id, target_range)
+        color = discord.Color.green() if success else discord.Color.orange()
+        
+        await interaction.followup.send(
+            embed=make_embed("Move Member" if success else "Info", f"{self.member.mention} ({callsign})\n{message}", color, interaction.user),
+            ephemeral=True
+        )
+        
+        if success:
+            action = "sas-member-down" if self.is_demotion else "sas-member-up"
+            await log_command(interaction, action, target=self.member, changed=True, extra=f"callsign={callsign} pd_id={pd_id} target={target_range}")
+            # Send public notification
+            if SAS_MEMBER_NOTIFICATIONS_CHANNEL_ID:
+                notif_ch = bot.get_channel(SAS_MEMBER_NOTIFICATIONS_CHANNEL_ID)
+                if notif_ch:
+                    role_names = {
+                        'agent_special': 'AGENT SPECIAL',
+                        'coordonator_teste': 'Coordonator SAS - TESTE',
+                        'coordonator_sas': 'Coordonator SAS',
+                        'agent_sas': 'AGENT S.A.S'
+                    }
+                    target_name = role_names.get(target_range, target_range)
+                    emoji = "⬇️" if self.is_demotion else "⬆️"
+                    action_text = "Retrogradat" if self.is_demotion else "Promovat"
+                    notif_embed = discord.Embed(
+                        title=f"{emoji} Membru {action_text}",
+                        description=(
+                            f"**Membru:** {self.member.mention}\n"
+                            f"**Callsign PD:** {callsign}\n"
+                            f"**Rang nou:** {target_name}\n"
+                            f"**Poziție:** {message}\n"
+                            f"**{action_text} de:** {interaction.user.mention}"
+                        ),
+                        color=discord.Color.blue(),
+                        timestamp=local_now()
+                    )
+                    await notif_ch.send(embed=notif_embed)
+    
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Nu este sesiunea ta.", ephemeral=True)
+            return False
+        return True
+
+def move_member_to_specific_range(discord_id: str, target_range_name: str) -> tuple[bool, str]:
+    """
+    Move member to a specific target range.
+    target_range_name: 'agent_special', 'coordonator_teste', or 'coordonator_sas'
+    """
+    try:
+        client = get_google_sheets_client()
+        sheet = client.open_by_key(SAS_SPREADSHEET_ID).sheet1
+        
+        ranges = {
+            'coordonator_sas': sheet.range('B11:B12'),
+            'coordonator_teste': sheet.range('B14:B16'),
+            'agent_special': sheet.range('B18:B21'),
+            'agent_sas': sheet.range('B23:B40')
+        }
+        
+        # Find current position
+        member_cell = None
+        for cells in ranges.values():
+            for cell in cells:
+                if cell.value == discord_id:
+                    member_cell = cell
+                    break
+            if member_cell:
+                break
+        
+        if not member_cell:
+            return False, "Membrul nu a fost găsit în niciun interval"
+        
+        # Get target range
+        if target_range_name not in ranges:
+            return False, "Rang țintă invalid"
+        
+        target_cells = ranges[target_range_name]
+        
+        # Find empty slot in target range
+        for target_cell in target_cells:
+            if not target_cell.value or target_cell.value.strip() == "":
+                # Move member
+                member_cell.value = ""
+                target_cell.value = discord_id
+                sheet.update_cells([member_cell, target_cell])
+                
+                # Force recalc
+                batch_data = [
+                    {'range': member_cell.address, 'values': [[""]]},
+                    {'range': target_cell.address, 'values': [[discord_id]]}
+                ]
+                sheet.batch_update(batch_data, value_input_option='USER_ENTERED')
+                
+                # Get callsign from column D
+                callsign = sheet.cell(target_cell.row, 4).value or "N/A"
+                
+                role_names = {
+                    'coordonator_sas': 'Coordonator SAS',
+                    'coordonator_teste': 'Coordonator SAS - TESTE',
+                    'agent_special': 'AGENT SPECIAL'
+                }
+                role_name = role_names.get(target_range_name, target_range_name)
+                
+                return True, f"Membru mutat la {role_name}: {callsign}"
+        
+        # No empty slots
+        range_labels = {
+            'coordonator_sas': 'Coordonator SAS (B11:B12)',
+            'coordonator_teste': 'Coordonator SAS - TESTE (B14:B16)',
+            'agent_special': 'AGENT SPECIAL (B18:B21)'
+        }
+        return False, f"Nu există poziții libere în {range_labels.get(target_range_name, target_range_name)}"
+        
+    except Exception as e:
+        logging.error(f"Error moving member to specific range: {e}")
+        return False, f"Eroare: {str(e)}"
+
+class SASMemberSelectView(discord.ui.View):
+    def __init__(self, requester_id: int, action: str):
+        super().__init__(timeout=120)
+        self.requester_id = requester_id
+        self.action = action
+        self.add_item(SASMemberUserSelect(self, action))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Nu este sesiunea ta.", ephemeral=True)
+            return False
+        return True
 # --------------- SAS Action Log (NEW) ---------------
 CHECK_EMOJI = "✅"
 
@@ -2164,22 +3166,27 @@ class RemovePontajUserSelectView(discord.ui.View):
 
 # --------------- EOD HELPERS ---------------
 
-async def _send_eod_confirm_request(uid: int, *, is_sas: bool, date: str, start_time: str):
+async def _send_eod_confirm_request(uid: int, *, is_sas: bool, date: str, start_time: str, end_time: str = "23:59:59"):
     """
     Ask the user to confirm saving the open session by reacting ✅ within the window.
     DM first; if DM blocked, post in the appropriate guild channel.
     """
-    end_time = "23:59:59"
     start_dt = parse_local(date, start_time)
     end_dt = parse_local(date, end_time)
-    mins = (end_dt - start_dt).total_seconds() / 60.0  # use exact minutes (float)
+    
+    # Calculate minutes
+    mins = (end_dt - start_dt).total_seconds() / 60.0
     rounded = round_minutes(mins)
+    
+    # Determine reminder text based on end_time
+    reminder = "**NU UITA SA PORNESTI PONTAJUL DUPA ORA 00:00**" if end_time == "23:59:59" else "**POTI PORNI PONTAJUL DUPA ORA 05:30**"
+    
     text = (
         f"Confirmare pontaj {'SAS' if is_sas else 'PD'} pentru {date}\n"
         f"Start: {start_time} -> End propus: {end_time}. Total: {rounded} minute\n"
         f"Reacționează cu {EOD_CONFIRM_EMOJI} în {EOD_CONFIRM_WINDOW_SECS // 60} minute pentru a salva.\n"
-        f"Dacă nu reacționezi, sesiunea NU va fi salvată."
-        f"**NU UITA SA PORNESTI PONTAJUL DUPA ORA 00:00**"
+        f"Dacă nu reacționezi, sesiunea NU va fi salvată.\n"
+        f"{reminder}"
     )
     # Try DM
     msg = None
@@ -2209,6 +3216,7 @@ async def _send_eod_confirm_request(uid: int, *, is_sas: bool, date: str, start_
         "is_sas": is_sas,
         "date": date,
         "ci": start_time,
+        "end_time": end_time,  # Store the end_time
         "channel_id": getattr(msg.channel, "id", None)
     }
     bot.loop.create_task(_finalize_eod_confirm_after(msg.id, EOD_CONFIRM_WINDOW_SECS))
@@ -2270,7 +3278,8 @@ class Bot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.start_time = datetime.datetime.utcnow()
         self.relay_sessions: Dict[int, Dict[str, Any]] = {}
-        self.last_auto_close_day: str | None = None  
+        self.last_auto_close_day: str | None = None
+        self.last_auto_close_night: str | None = None  # Add this line  
         self.active_action_logs: Dict[int, Dict[str, Any]] = {}
         self.console_relay_enabled: bool = False
         self.console_relay_channel_id: int | None = CONSOLE_RELAY_DEFAULT_CHANNEL_ID or None
@@ -2286,6 +3295,7 @@ class Bot(commands.Bot):
             self.add_view(HrButtons())
             self.add_view(RelayButtons())
             self.add_view(SASCoordonatorButtons())
+            self.add_view(SASMemberManagementButtons())  # Add this line
         except NameError:
             # View defined later; silent if ordering changes
             pass
@@ -2370,40 +3380,89 @@ class Bot(commands.Bot):
 
     @tasks.loop(minutes=1)
     async def auto_close_today_sessions(self):
-        """
-        At 23:58 ask all users with open sessions (PD + SAS) to confirm saving the day.
-        Only confirmed sessions are saved (end 23:59:59); others are deleted.
-        """
         now = local_now()
-        if not (now.hour == 23 and now.minute == 55):
-            return
-        day = now.strftime("%Y-%m-%d")
-        if self.last_auto_close_day == day:
-            return  # already processed
+        day = now.strftime("%Y-%m-%d")  # Always use current day
+        
+        # Case 1: End of night shift (05:30) - close sessions started TODAY between 00:00-05:30
+        if now.hour == 5 and now.minute == 25:
+            # Use separate tracking variable to allow both to run same day
+            if hasattr(self, 'last_auto_close_night') and self.last_auto_close_night == day:
+                return
+            
+            # Filter sessions: only those starting between 00:00 and 05:30 TODAY
+            pd_night = []
+            sas_night = []
+            
+            for uid, date, ci in get_ongoing_sessions():
+                if date == day:  # Current day
+                    # Parse start time to check if it's between 00:00 and 05:25
+                    try:
+                        hour, minute = map(int, ci.split(":")[:2])
+                        if hour < 5 or (hour == 5 and minute <= 25):  # 00:00 to 05:25
+                            pd_night.append((uid, date, ci))
+                    except Exception:
+                        pass
+            
+            for uid, date, ci in get_ongoing_sessions_sas():
+                if date == day:  # Current day
+                    try:
+                        hour, minute = map(int, ci.split(":")[:2])
+                        if hour < 5 or (hour == 5 and minute <= 25):  # 00:00 to 05:25
+                            sas_night.append((uid, date, ci))
+                    except Exception:
+                        pass
+            
+            sent_pd = 0
+            sent_sas = 0
+            
+            for uid, date, ci in pd_night:
+                ok = await _send_eod_confirm_request(uid, is_sas=False, date=date, start_time=ci, end_time="05:30:00")
+                if ok:
+                    sent_pd += 1
+            
+            for uid, date, ci in sas_night:
+                ok = await _send_eod_confirm_request(uid, is_sas=True, date=date, start_time=ci, end_time="05:30:00")
+                if ok:
+                    sent_sas += 1
+            
+            self.last_auto_close_night = day
+            summary = f"Night shift confirm (05:25) trimis pentru {day}: PD={sent_pd} SAS={sent_sas} (fereastră {EOD_CONFIRM_WINDOW_SECS//60}m)"
+            _append_log_line(f"[{datetime.datetime.utcnow().isoformat()}Z] [EOD_NIGHT] {summary}")
+            ch = self.get_channel(LOGS_CHANNEL_ID)
+            if ch:
+                try:
+                    await ch.send(embed=make_embed("Night Shift Confirm", summary, discord.Color.teal()))
+                except Exception:
+                    pass
+        
+        # Case 2: End of day (23:55) - close ALL sessions from current day
+        elif now.hour == 23 and now.minute == 55:
+            if self.last_auto_close_day == day:
+                return  # already processed
+            
+            pd_open = [(uid, date, ci) for uid, date, ci in get_ongoing_sessions() if date == day]
+            sas_open = [(uid, date, ci) for uid, date, ci in get_ongoing_sessions_sas() if date == day]
 
-        pd_open = [(uid, date, ci) for uid, date, ci in get_ongoing_sessions() if date == day]
-        sas_open = [(uid, date, ci) for uid, date, ci in get_ongoing_sessions_sas() if date == day]
+            sent_pd = 0
+            sent_sas = 0
+            for uid, date, ci in pd_open:
+                ok = await _send_eod_confirm_request(uid, is_sas=False, date=date, start_time=ci, end_time="23:59:59")
+                if ok:
+                    sent_pd += 1
+            for uid, date, ci in sas_open:
+                ok = await _send_eod_confirm_request(uid, is_sas=True, date=date, start_time=ci, end_time="23:59:59")
+                if ok:
+                    sent_sas += 1
 
-        sent_pd = 0
-        sent_sas = 0
-        for uid, date, ci in pd_open:
-            ok = await _send_eod_confirm_request(uid, is_sas=False, date=date, start_time=ci)
-            if ok:
-                sent_pd += 1
-        for uid, date, ci in sas_open:
-            ok = await _send_eod_confirm_request(uid, is_sas=True, date=date, start_time=ci)
-            if ok:
-                sent_sas += 1
-
-        self.last_auto_close_day = day
-        summary = f"EOD confirm trimis pentru {day}: PD={sent_pd} SAS={sent_sas} (fereastră {EOD_CONFIRM_WINDOW_SECS//60}m)"
-        _append_log_line(f"[{datetime.datetime.utcnow().isoformat()}Z] [EOD] {summary}")
-        ch = self.get_channel(LOGS_CHANNEL_ID)
-        if ch:
-            try:
-                await ch.send(embed=make_embed("EOD Confirm", summary, discord.Color.teal()))
-            except Exception:
-                pass
+            self.last_auto_close_day = day
+            summary = f"EOD confirm (23:55) trimis pentru {day}: PD={sent_pd} SAS={sent_sas} (fereastră {EOD_CONFIRM_WINDOW_SECS//60}m)"
+            _append_log_line(f"[{datetime.datetime.utcnow().isoformat()}Z] [EOD] {summary}")
+            ch = self.get_channel(LOGS_CHANNEL_ID)
+            if ch:
+                try:
+                    await ch.send(embed=make_embed("EOD Confirm", summary, discord.Color.teal()))
+                except Exception:
+                    pass
 
     @auto_close_today_sessions.before_loop
     async def before_auto_close_today_sessions(self):
@@ -2572,7 +3631,9 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             return
         if payload.user_id != data["uid"]:
             return  # only the owner can confirm
-        end_time = "23:59:59"
+        
+        end_time = data.get("end_time", "23:59:59")  # Use stored end_time
+        
         try:
             # Save session
             if data["is_sas"]:
@@ -2583,7 +3644,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             # Compute minutes for the saved interval
             start_dt = parse_local(data["date"], data["ci"])
             end_dt = parse_local(data["date"], end_time)
-            mins = (end_dt - start_dt).total_seconds() / 60.0  # use exact minutes (float)
+            mins = (end_dt - start_dt).total_seconds() / 60.0
             rounded = round_minutes(mins)
 
             # Edit message -> confirmed + show minutes
@@ -2813,6 +3874,21 @@ async def sascoordpanel_cmd(interaction: discord.Interaction):
         view=SASCoordonatorButtons()
     )
     await log_command(interaction, "sascoordpanel", changed=False)
+
+@bot.tree.command(name="sasmemberpanel", description="Postează panoul Evidență Membri SAS")
+async def sasmemberpanel_cmd(interaction: discord.Interaction):
+    OWNER_ID = 286492096242909185
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message(
+            embed=make_embed("Permisiune", "Restricționat.", discord.Color.red(), interaction.user),
+            ephemeral=True
+        )
+        return
+    await interaction.response.send_message(
+        embed=make_embed("Evidență Membri SAS", "Folosește butoanele pentru a gestiona membrii SAS în spreadsheet.", discord.Color.blurple(), interaction.user),
+        view=SASMemberManagementButtons()
+    )
+    await log_command(interaction, "sasmemberpanel", changed=False)
 
 # ------------ Say command -----------------
 MAIN_GUILD_ID = int(need("MAIN_GUILD_ID"))
